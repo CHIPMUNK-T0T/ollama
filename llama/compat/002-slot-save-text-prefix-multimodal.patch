@@ -1,0 +1,74 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index da6a475..e66cf55 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1871,6 +1871,23 @@ private:
+         return true;
+     }
+ 
++    // Like check_no_mtmd, but multimodal-aware: a multimodal model can still
++    // save/restore the KV of a PURE-TEXT prefix. Media (image/audio) chunks
++    // occupy positions stored as LLAMA_TOKEN_NULL placeholders, which the
++    // flat-token slot save format cannot represent. get_text_tokens() drops
++    // those placeholders, so a size mismatch means the slot holds media.
++    // (get_tokens() cannot be used here: it asserts !has_mtmd.)
++    bool check_slot_text_only(const server_slot * slot, const int id_task) {
++        if (mctx && slot != nullptr &&
++                slot->prompt.tokens.get_text_tokens().size() != slot->prompt.tokens.size()) {
++            send_error(id_task,
++                "Slot KV save/restore is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
++                ERROR_TYPE_NOT_SUPPORTED);
++            return false;
++        }
++        return true;
++    }
++
+     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+@@ -2330,16 +2347,17 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_SAVE:
+                 {
+-                    if (!check_no_mtmd(task.id)) {
+-                        break;
+-                    }
+-
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                         break;
+                     }
++                    // Allow saving a pure-text prefix even when multimodal is
++                    // loaded; reject only if the slot holds media tokens.
++                    if (!check_slot_text_only(slot, task.id)) {
++                        break;
++                    }
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+@@ -2353,7 +2371,11 @@ private:
+                     std::string filename = task.slot_action.filename;
+                     std::string filepath = task.slot_action.filepath;
+ 
+-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
++                    // Use get_text_tokens() instead of get_tokens() (which
++                    // asserts !has_mtmd): for a verified text-only slot it is the
++                    // full token list, and under a multimodal context it avoids
++                    // the assert. token_count == tokens.size() for text-only.
++                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
+                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+ 
+                     const int64_t t_end = ggml_time_us();
+@@ -2371,7 +2393,9 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_RESTORE:
+                 {
+-                    if (!check_no_mtmd(task.id)) break;
++                    // A multimodal model may restore a pure-text prefix: the save
++                    // path only writes text-only slots, and the restore replaces
++                    // the slot tokens with the (text) tokens read from the file.
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
