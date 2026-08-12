@@ -24,12 +24,14 @@ func Execute(args []string) error {
 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
 
 	var (
-		modelName string
-		port      int
+		modelName        string
+		port             int
+		prefillCachePath string
 	)
 
 	flagSet := flag.NewFlagSet("mlxrunner", flag.ExitOnError)
 	flagSet.StringVar(&modelName, "model", "", "Model name")
+	flagSet.StringVar(&prefillCachePath, "prefill-cache-path", "", "Internal prefill cache path")
 	flagSet.IntVar(&port, "port", 0, "Port to listen on")
 	_ = flagSet.Bool("verbose", false, "Enable debug logging")
 	flagSet.Parse(args)
@@ -87,6 +89,21 @@ func Execute(args []string) error {
 	)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/prefill-cache/save", func(w http.ResponseWriter, r *http.Request) {
+		if err := worker.Do(r.Context(), func() error { return runner.cache.save(r.Context(), prefillCachePath) }); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /internal/prefill-cache/restore", func(w http.ResponseWriter, r *http.Request) {
+		if err := worker.Do(r.Context(), func() error { return runner.cache.restore(r.Context(), prefillCachePath) }); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(statusResponse{
 			Status:        0,

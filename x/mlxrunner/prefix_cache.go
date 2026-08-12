@@ -40,6 +40,10 @@ type prefixCache struct {
 	// draftLookahead is how far the draft caches' entries reference past
 	// their own slot; trie keys pack each token with its look-ahead (see key).
 	draftLookahead int
+
+	// keepPersistedSnapshot prevents a transient restore failure from being
+	// mistaken for an intentionally empty cache during unload.
+	keepPersistedSnapshot bool
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
