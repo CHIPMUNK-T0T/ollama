@@ -27,13 +27,14 @@ import (
 )
 
 type LlmRequest struct {
-	ctx             context.Context //nolint:containedctx
-	model           *Model
-	opts            api.Options
-	sessionDuration *api.Duration
-	successCh       chan *runnerRef
-	errCh           chan error
-	schedAttempts   uint
+	ctx              context.Context //nolint:containedctx
+	model            *Model
+	opts             api.Options
+	sessionDuration  *api.Duration
+	successCh        chan *runnerRef
+	errCh            chan error
+	schedAttempts    uint
+	prefillCachePath string
 
 	// oomRetryAttempted is set after a llama-server load crash triggers an
 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
@@ -73,11 +74,12 @@ type Scheduler struct {
 	activeLoading llm.LlamaServer
 	loaded        map[string]*runnerRef
 
-	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
-	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
-	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
-	getSystemInfoFn func() ml.SystemInfo
-	waitForRecovery time.Duration
+	loadFn           func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
+	newServerFn      func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
+	getGpuFn         func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
+	getSystemInfoFn  func() ml.SystemInfo
+	waitForRecovery  time.Duration
+	prefillCacheRoot string
 }
 
 // Default automatic value for number of models we allow per GPU
@@ -89,16 +91,18 @@ var ErrMaxQueue = errors.New("server busy, please try again.  maximum pending re
 
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxQueue := envconfig.MaxQueue()
+	prefillCacheRoot := initPrefillCacheRoot(ctx)
 	sched := &Scheduler{
-		pendingReqCh:    make(chan *LlmRequest, maxQueue),
-		finishedReqCh:   make(chan *LlmRequest, maxQueue),
-		expiredCh:       make(chan *runnerRef, maxQueue),
-		unloadedCh:      make(chan any, maxQueue),
-		loaded:          make(map[string]*runnerRef),
-		newServerFn:     llm.NewLlamaServer,
-		getGpuFn:        discover.GPUDevices,
-		getSystemInfoFn: discover.GetSystemInfo,
-		waitForRecovery: 5 * time.Second,
+		pendingReqCh:     make(chan *LlmRequest, maxQueue),
+		finishedReqCh:    make(chan *LlmRequest, maxQueue),
+		expiredCh:        make(chan *runnerRef, maxQueue),
+		unloadedCh:       make(chan any, maxQueue),
+		loaded:           make(map[string]*runnerRef),
+		newServerFn:      llm.NewLlamaServer,
+		getGpuFn:         discover.GPUDevices,
+		getSystemInfoFn:  discover.GetSystemInfo,
+		waitForRecovery:  5 * time.Second,
+		prefillCacheRoot: prefillCacheRoot,
 	}
 	sched.loadFn = sched.load
 	return sched
@@ -446,22 +450,27 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				// do not delete the mismatched loaded runner, or wait for VRAM
 				// convergence.
 				slog.Debug("orphaned runner shutting down", "orphan", runner, "loaded", runnerToUnload)
-				runner.unload()
 				s.loadedMu.Unlock()
+				runner.unload()
 				runner.refMu.Unlock()
 			} else {
-				slog.Debug("starting background wait for VRAM recovery", "runner", runner)
 				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
 				for _, r := range s.loaded {
 					runnersSnapshot = append(runnersSnapshot, r)
 				}
+				s.loadedMu.Unlock()
+				runner.savePrefillCache(ctx)
+				slog.Debug("starting background wait for VRAM recovery", "runner", runner)
 				finished := s.waitForVRAMRecovery(runner, runnersSnapshot)
 				runner.unload()
-				delete(s.loaded, runner.modelKey)
+				runner.refMu.Unlock()
+				s.loadedMu.Lock()
+				if s.loaded[runner.modelKey] == runner {
+					delete(s.loaded, runner.modelKey)
+				}
 				s.loadedMu.Unlock()
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
-				runner.refMu.Unlock()
 				slog.Debug("sending an unloaded event", "runner", runner)
 				s.unloadedCh <- struct{}{}
 			}
@@ -519,6 +528,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	var f *ggml.GGML
 	loadGpus := gpus
 	var launchOpts api.Options
+	prefillCachePath := req.prefillCachePath
 
 	if llama == nil {
 		var err error
@@ -531,6 +541,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				s.loadedMu.Unlock()
 				return false
 			}
+
+			// Preserve request options before placement tuning mutates them.
+			identityOpts := req.opts.Runner
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
@@ -574,6 +587,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			config := llamaServerConfigForModel(req.model)
 			config.ContextShift = req.contextShift
+			prefillCachePath = s.llamaPrefillCachePath(req, identityOpts, numParallel)
+			config.PrefillCachePath = prefillCachePath
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -585,7 +600,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			}
 		} else {
 			modelName := req.model.ShortName
-			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
+			prefillCachePath = s.mlxPrefillCachePath(req)
+			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx, prefillCachePath)
 		}
 		if err != nil {
 			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
@@ -594,6 +610,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			return false
 		}
 
+		req.prefillCachePath = prefillCachePath
 		s.activeLoading = llama
 	} else {
 		wantPath := req.model.ModelPath
@@ -694,23 +711,25 @@ iGPUScan:
 		req.contextShift = resolveContextShift(req.shift, req.model)
 	}
 	runner := &runnerRef{
-		model:           req.model,
-		modelPath:       req.model.ModelPath,
-		modelKey:        schedulerModelKey(req.model),
-		llama:           llama,
-		Options:         &req.opts,
-		sessionDuration: sessionDuration,
-		gpus:            gpuIDs,
-		discreteGPUs:    discreteGPUs,
-		totalSize:       totalSize,
-		vramSize:        vramSize,
-		loading:         true,
-		pid:             llama.Pid(),
-		numCtxAuto:      req.numCtxAuto,
-		numBatchAuto:    req.numBatchAuto,
-		useMMapAuto:     req.useMMapAuto,
-		contextShift:    req.contextShift,
-		trainContext:    trainContext,
+		model:            req.model,
+		modelPath:        req.model.ModelPath,
+		modelKey:         schedulerModelKey(req.model),
+		llama:            llama,
+		Options:          &req.opts,
+		sessionDuration:  sessionDuration,
+		gpus:             gpuIDs,
+		discreteGPUs:     discreteGPUs,
+		totalSize:        totalSize,
+		vramSize:         vramSize,
+		loading:          true,
+		pid:              llama.Pid(),
+		numCtxAuto:       req.numCtxAuto,
+		numBatchAuto:     req.numBatchAuto,
+		useMMapAuto:      req.useMMapAuto,
+		contextShift:     req.contextShift,
+		trainContext:     trainContext,
+		prefillCacheRoot: s.prefillCacheRoot,
+		prefillCacheDir:  prefillCachePath,
 	}
 	runner.numParallel = numParallel
 	runner.refMu.Lock() // hold lock until running or aborted
@@ -737,6 +756,7 @@ iGPUScan:
 			s.expiredCh <- runner
 			return
 		}
+		runner.restorePrefillCache(req.ctx)
 		slog.Debug("finished setting up", "runner", runner)
 		if runner.pid < 0 {
 			runner.pid = llama.Pid()
@@ -1351,15 +1371,18 @@ type runnerRef struct {
 	expireTimer     *time.Timer
 	expiresAt       time.Time
 
-	model        *Model
-	modelPath    string
-	modelKey     string
-	numParallel  int
-	numCtxAuto   bool
-	numBatchAuto bool
-	useMMapAuto  bool
-	contextShift bool
-	trainContext int
+	model                     *Model
+	modelPath                 string
+	modelKey                  string
+	numParallel               int
+	numCtxAuto                bool
+	numBatchAuto              bool
+	useMMapAuto               bool
+	contextShift              bool
+	trainContext              int
+	prefillCacheRoot          string
+	prefillCacheDir           string
+	prefillCacheSaveAttempted bool
 	*api.Options
 }
 
@@ -1370,6 +1393,8 @@ func (runner *runnerRef) unload() {
 		runner.expireTimer = nil
 	}
 	if runner.llama != nil {
+		runner.savePrefillCache(context.Background())
+		prunePrefillCache(runner.prefillCacheRoot, maxPrefillCacheDiskBytes, runner.prefillCacheDir)
 		runner.llama.Close()
 	}
 	runner.model = nil
@@ -1694,19 +1719,27 @@ func (s *Scheduler) findRunnerToUnload() *runnerRef {
 
 func (s *Scheduler) unloadAllRunners() {
 	s.loadedMu.Lock()
-	defer s.loadedMu.Unlock()
+	activeLoading := s.activeLoading
+	s.activeLoading = nil
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, runner := range s.loaded {
+		runners = append(runners, runner)
+	}
+	clear(s.loaded)
+	s.loadedMu.Unlock()
 
-	if s.activeLoading != nil {
+	if activeLoading != nil {
 		slog.Debug("shutting down currently loading runner")
-		s.activeLoading.Close()
-		s.activeLoading = nil
+		activeLoading.Close()
 	}
 
-	for model, runner := range s.loaded {
+	for _, runner := range runners {
+		runner.refMu.Lock()
 		if runner.llama != nil {
-			slog.Debug("shutting down runner", "model", model)
+			slog.Debug("shutting down runner", "model", runner.modelKey)
 			runner.llama.Close()
 		}
+		runner.refMu.Unlock()
 	}
 }
 

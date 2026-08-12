@@ -33,6 +33,7 @@ import (
 type Client struct {
 	port              int
 	modelName         string
+	prefillCachePath  string
 	contextLength     atomic.Int64
 	softContextLength int // recommended limit to avoid poor performance
 	memory            atomic.Uint64
@@ -46,13 +47,15 @@ type Client struct {
 
 // NewClient prepares a new MLX runner client for LLM models.
 // The subprocess is not started until Load() is called.
-func NewClient(modelName string, softContextLength int) (*Client, error) {
+// If prefillCachePath is non-empty, the runner persists its prompt cache there across reloads.
+func NewClient(modelName string, softContextLength int, prefillCachePath string) (*Client, error) {
 	if err := checkPlatformSupport(); err != nil {
 		return nil, err
 	}
 
 	c := &Client{
 		modelName:         modelName,
+		prefillCachePath:  prefillCachePath,
 		softContextLength: softContextLength,
 		done:              make(chan struct{}),
 		client:            http.DefaultClient,
@@ -321,7 +324,11 @@ func (c *Client) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 	}
 
 	// Spawn subprocess: ollama runner --mlx-engine --model <name> --port <port>
-	cmd := exec.Command(exe, "runner", "--mlx-engine", "--model", c.modelName, "--port", strconv.Itoa(port))
+	args := []string{"runner", "--mlx-engine", "--model", c.modelName, "--port", strconv.Itoa(port)}
+	if c.prefillCachePath != "" {
+		args = append(args, "--prefill-cache-path", c.prefillCachePath)
+	}
+	cmd := exec.Command(exe, args...)
 	cmd.Env = os.Environ()
 
 	// Set library path environment variable for MLX libraries
